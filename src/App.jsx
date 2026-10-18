@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ShieldCheck, UploadCloud, Image as ImageIcon, Video, FileCheck2, FileWarning,
   Trash2, Download, CheckCircle2, AlertCircle, LoaderCircle, LockKeyhole,
-  ChevronDown, X, Files, ScanSearch, RotateCcw, Bot, Sparkles, Camera, MapPin, Eye
+  ChevronDown, X, Files, ScanSearch, RotateCcw, Bot, Sparkles, Camera, MapPin, Eye, Heart
 } from 'lucide-react';
 import * as exifr from 'exifr';
 import { analyzeMediaMetadata, analyzeVideoMetadata } from './metadataAnalyzer.js';
@@ -383,7 +383,18 @@ function App() {
         <div className="how-card"><span>03</span><FileCheck2 size={21} /><h3>Verify & Download</h3><p>Compare Before vs After to verify that all hidden parameters and tracking markers were eradicated.</p></div>
       </div>
     </section>
-    <footer><a className="brand footer-brand" href="#"><span className="brand-mark"><ShieldCheck size={17} /></span><span>metaclean</span></a><p className="footer-disclaimer">We never store your files or upload them to any server. All processing happens directly on your device, ensuring complete privacy.</p></footer>
+    <footer>
+      <div className="footer-top">
+        <a className="brand footer-brand" href="#" aria-label="MetaClean home">
+          <span className="brand-mark"><ShieldCheck size={17} /></span>
+          <span>metaclean</span>
+        </a>
+        <div className="made-by">
+          Made with <Heart size={12} className="heart-icon" fill="currentColor" /> by <span>Ayush</span>
+        </div>
+      </div>
+      <p className="footer-disclaimer">We never store your files or upload them to any server. All processing happens directly on your device, ensuring complete privacy.</p>
+    </footer>
 
     {/* Metadata & AI Inspector Modal */}
     {inspectingItem && (
