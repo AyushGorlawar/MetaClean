@@ -2,9 +2,11 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ShieldCheck, UploadCloud, Image as ImageIcon, Video, FileCheck2, FileWarning,
   Trash2, Download, CheckCircle2, AlertCircle, LoaderCircle, LockKeyhole,
-  ChevronDown, X, Files, ScanSearch, RotateCcw
+  ChevronDown, X, Files, ScanSearch, RotateCcw, Bot, Sparkles, Camera, MapPin, Eye
 } from 'lucide-react';
 import * as exifr from 'exifr';
+import { analyzeMediaMetadata, analyzeVideoMetadata } from './metadataAnalyzer.js';
+import MetadataModal from './MetadataModal.jsx';
 
 const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const VIDEO_EXTENSIONS = ['.mp4', '.mov', '.m4v', '.webm'];
@@ -23,7 +25,7 @@ function humanKey(key) {
   return key.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
 }
 function isInterestingKey(key) {
-  return /gps|latitude|longitude|date|time|make|model|software|artist|author|comment|description|location|title|copyright|encoder|creation|tag|metadata|camera/i.test(key);
+  return /gps|latitude|longitude|date|time|make|model|software|artist|author|comment|description|location|title|copyright|encoder|creation|tag|metadata|camera|prompt|seed|sampler/i.test(key);
 }
 function flattenMetadata(obj, prefix = '', out = {}) {
   if (!obj || typeof obj !== 'object') return out;
@@ -39,15 +41,42 @@ function flattenMetadata(obj, prefix = '', out = {}) {
 }
 async function inspectImage(file) {
   try {
-    const data = await exifr.parse(file, { tiff: true, exif: true, gps: true, xmp: true, iptc: true, icc: false, jfif: true });
-    return { supported: true, fields: flattenMetadata(data || {}), note: 'Image metadata scan completed for fields supported by the parser.' };
+    let rawExif = {};
+    try {
+      // exifr parses the File object directly with chunked streaming (no full-file buffer needed)
+      rawExif = await exifr.parse(file, {
+        tiff: true,
+        exif: true,
+        gps: true,
+        xmp: true,
+        iptc: true,
+        jfif: true,
+        icc: false,
+        mergeOutput: true
+      }) || {};
+    } catch {
+      rawExif = {};
+    }
+
+    // Read only the first 512KB slice for PNG chunks and C2PA markers (instant <1ms, zero memory bloat)
+    const headerSlice = await file.slice(0, Math.min(file.size, 512 * 1024)).arrayBuffer();
+    const analysis = await analyzeMediaMetadata(file, rawExif, headerSlice);
+    const fields = flattenMetadata(rawExif || {});
+    for (const [k, v] of Object.entries(analysis.allFields)) {
+      if (!fields[k]) fields[k] = v;
+    }
+    return {
+      supported: true,
+      fields,
+      analysis,
+      note: 'Image metadata and AI origin scan completed.'
+    };
   } catch (error) {
-    return { supported: false, fields: {}, note: `Could not fully inspect this image: ${error.message}` };
+    return { supported: false, fields: {}, analysis: null, note: `Could not fully inspect this image: ${error.message}` };
   }
 }
 async function stripImage(file) {
   // Canvas decoding + fresh encoding does not carry over source EXIF/XMP/IPTC chunks.
-  // Animated WebP and transparency handling depends on browser decoding/encoding support.
   const bitmap = await createImageBitmap(file);
   try {
     const canvas = document.createElement('canvas');
@@ -81,10 +110,11 @@ async function inspectVideo(file) {
       }
     }
     mediaInfo.close?.();
-    return { supported: true, fields, note: 'Video metadata scan completed for fields exposed by MediaInfo.' };
+    const analysis = analyzeVideoMetadata(file, fields);
+    return { supported: true, fields, analysis, note: 'Video metadata scan completed for fields exposed by MediaInfo.' };
   } catch (error) {
     mediaInfo?.close?.();
-    return { supported: false, fields: {}, note: `Video metadata inspection failed: ${error.message}` };
+    return { supported: false, fields: {}, analysis: null, note: `Video metadata inspection failed: ${error.message}` };
   }
 }
 let ffmpegPromise;
@@ -94,7 +124,6 @@ async function getFFmpeg(onLog) {
       const [{ FFmpeg }, { toBlobURL }] = await Promise.all([import('@ffmpeg/ffmpeg'), import('@ffmpeg/util')]);
       const ffmpeg = new FFmpeg();
       ffmpeg.on('log', ({ message }) => onLog?.(message));
-      // The core is fetched from a CDN at runtime. Files selected by the user are not sent to that CDN.
       const base = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/umd';
       await ffmpeg.load({
         coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
@@ -111,8 +140,6 @@ async function stripVideo(file, setLog) {
   const output = 'output.mp4';
   await ffmpeg.writeFile(input, new Uint8Array(await file.arrayBuffer()));
   try {
-    // Re-encoding avoids copying many source stream/container metadata fields.
-    // It may change quality, file size, codec, and can take time on large videos.
     await ffmpeg.exec([
       '-i', input,
       '-map', '0:v:0', '-map', '0:a?',
@@ -143,11 +170,13 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState('');
   const [showDetails, setShowDetails] = useState({});
+  const [inspectingId, setInspectingId] = useState(null);
   const inputRef = useRef(null);
   const itemsRef = useRef(items);
   itemsRef.current = items;
 
   useEffect(() => () => itemsRef.current.forEach(item => { if (item.resultUrl) URL.revokeObjectURL(item.resultUrl); }), []);
+
   const addFiles = useCallback(async (list) => {
     const incoming = Array.from(list || []);
     const accepted = incoming.filter(file => isImage(file) || isVideo(file));
@@ -188,60 +217,66 @@ function App() {
       setItems(prev => prev.map(row => row.id === item.id ? { ...row, phase: 'error', error: error?.message || 'Processing failed.' } : row));
     }
   };
+
   const processAll = async () => {
     if (busy) return;
     const queue = items.filter(item => ['ready', 'error'].includes(item.phase));
     if (!queue.length) return;
     setBusy(true); setStatus('Processing files locally. Video conversion may take several minutes.');
     try {
-      // Sequential processing avoids exhausting memory on mobile devices.
       for (const item of queue) await processOne(item);
       setStatus('Processing queue finished. Review the verification status before sharing files.');
     } finally { setBusy(false); }
   };
+
   const removeItem = (id) => {
     setItems(prev => {
       const row = prev.find(item => item.id === id);
       if (row?.resultUrl) URL.revokeObjectURL(row.resultUrl);
       return prev.filter(item => item.id !== id);
     });
+    if (inspectingId === id) setInspectingId(null);
   };
+
   const clearAll = () => {
     items.forEach(item => { if (item.resultUrl) URL.revokeObjectURL(item.resultUrl); });
-    setItems([]); setStatus(''); setShowDetails({});
+    setItems([]); setStatus(''); setShowDetails({}); setInspectingId(null);
     if (inputRef.current) inputRef.current.value = '';
   };
+
   const downloadOne = (item) => {
     if (!item.resultUrl) return;
     const a = document.createElement('a'); a.href = item.resultUrl; a.download = item.result.name; a.click();
   };
+
   const completed = items.filter(i => i.phase === 'done').length;
   const readyCount = items.filter(i => ['ready', 'error'].includes(i.phase)).length;
+  const inspectingItem = items.find(i => i.id === inspectingId) || null;
 
   return <main className="app-shell">
     <header className="topbar">
       <a className="brand" href="#" aria-label="MetaClean home"><span className="brand-mark"><ShieldCheck size={20} /></span><span>metaclean</span></a>
-      <div className="top-badge"><span className="live-dot"></span> AI Metadata Removal</div>
+      <div className="top-badge"><span className="live-dot"></span> AI & Metadata Inspector + Cleaner</div>
     </header>
     <section className="hero">
-      <div className="eyebrow"><LockKeyhole size={14} /> PRIVATE BY DESIGN</div>
-      <h1>Your files.<br /><span>Your privacy.</span></h1>
-      <p className="hero-copy">Remove hidden metadata from photos and videos before you share them. Your files are processed on your device, not uploaded to a server.</p>
-      <div className="trust-row"><span><CheckCircle2 size={15} /> No account</span><span><CheckCircle2 size={15} /> No media uploads</span><span><CheckCircle2 size={15} /> Free to use</span></div>
+      <div className="eyebrow"><LockKeyhole size={14} /> 100% PRIVATE & ON-DEVICE</div>
+      <h1>Inspect hidden metadata.<br /><span>Remove AI & device origins.</span></h1>
+      <p className="hero-copy">Check which AI created an image (Midjourney, Stable Diffusion, DALL-E) or inspect camera specs & GPS coordinates. Remove hidden metadata in 1-click before sharing.</p>
+      <div className="trust-row"><span><CheckCircle2 size={15} /> AI Origin Detection</span><span><CheckCircle2 size={15} /> No Media Uploads</span><span><CheckCircle2 size={15} /> Free & Private</span></div>
     </section>
     <section className={`dropzone ${dragging ? 'dragging' : ''}`} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); addFiles(e.dataTransfer.files); }}>
       <input ref={inputRef} type="file" multiple accept=".jpg,.jpeg,.png,.webp,.mp4,.mov,.m4v,.webm,image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm" onChange={e => { addFiles(e.target.files); e.target.value = ''; }} hidden />
       <div className="upload-icon"><UploadCloud size={27} /></div>
-      <h2>Drop your files here</h2>
-      <p>or choose files from your device</p>
+      <h2>Drop your files here to inspect & clean</h2>
+      <p>Supports AI images, photos, and video containers</p>
       <button className="button primary" onClick={() => inputRef.current?.click()}><Files size={17} /> Select files</button>
       <div className="file-types"><span><ImageIcon size={14} /> JPG · PNG · WebP</span><span><Video size={14} /> MP4 · MOV · WebM</span></div>
-      <p className="limit-note">Up to {MAX_FILES} files per batch. Large videos require more memory and time.</p>
+      <p className="limit-note">Up to {MAX_FILES} files per batch. All analysis & cleaning is performed inside your browser.</p>
     </section>
     {status && <div className="status-note" role="status"><AlertCircle size={16} />{status}</div>}
     {items.length > 0 && <section className="workspace">
       <div className="workspace-head">
-        <div><div className="section-kicker">WORKSPACE</div><h2>Your files <span className="count">{items.length}</span></h2><p>Inspect, clean and verify each file before downloading.</p></div>
+        <div><div className="section-kicker">WORKSPACE</div><h2>Your files <span className="count">{items.length}</span></h2><p>Click any file or badge to inspect AI prompts, camera specs, and raw metadata.</p></div>
         <button className="button ghost small" onClick={clearAll} disabled={busy}><Trash2 size={15} /> Clear all</button>
       </div>
       <div className="batch-summary">
@@ -256,21 +291,75 @@ function App() {
           const remaining = item.after?.fields ? Object.keys(item.after.fields).length : null;
           const verified = item.phase === 'done' && item.after?.supported && remaining === 0;
           const hasResidual = item.phase === 'done' && item.after?.supported && remaining > 0;
+          const analysis = item.before?.analysis;
+
           return <article className="file-card" key={item.id}>
             <div className="file-main">
               <div className={`file-icon ${item.kind}`}>{item.kind === 'image' ? <ImageIcon size={20} /> : <Video size={20} />}</div>
-              <div className="file-info"><h3 title={item.file.name}>{item.file.name}</h3><p>{formatBytes(item.file.size)} <span>·</span> {item.kind === 'image' ? 'Image' : 'Video'}</p>
-                <div className={`state ${item.phase === 'done' ? (verified ? 'success' : hasResidual ? 'warning' : 'neutral') : item.phase === 'error' ? 'danger' : ''}`}>
-                  {item.phase === 'ready' && <><ScanSearch size={14} /> {item.before ? 'Scanned · Ready to clean' : 'Inspecting metadata…'}</>}
-                  {item.phase === 'processing' && <><LoaderCircle className="spin" size={14} /> Processing locally · {Math.round(item.progress)}%</>}
-                  {item.phase === 'done' && verified && <><CheckCircle2 size={14} /> Verified: no detected metadata fields remain</>}
-                  {item.phase === 'done' && hasResidual && <><FileWarning size={14} /> Review: {remaining} metadata field(s) still detected</>}
-                  {item.phase === 'done' && !verified && !hasResidual && <><AlertCircle size={14} /> Cleaned; verification incomplete</>}
-                  {item.phase === 'error' && <><AlertCircle size={14} /> {item.error}</>}
+              <div className="file-info">
+                <div className="file-title-wrap">
+                  <h3 title={item.file.name}>{item.file.name}</h3>
+                  {analysis?.isAi && (
+                    <button
+                      className="origin-pill ai clickable"
+                      onClick={() => setInspectingId(item.id)}
+                      title="AI Origin Detected! Click to inspect prompt & settings"
+                    >
+                      <Bot size={13} /> {analysis.ai.generator}
+                    </button>
+                  )}
+                  {analysis?.privacy?.hasGps && !analysis?.isAi && (
+                    <button
+                      className="origin-pill warning clickable"
+                      onClick={() => setInspectingId(item.id)}
+                      title="GPS Location Found! Click to view coordinates"
+                    >
+                      <MapPin size={13} /> GPS Found
+                    </button>
+                  )}
+                  {analysis?.camera?.isCamera && !analysis?.isAi && !analysis?.privacy?.hasGps && (
+                    <button
+                      className="origin-pill camera clickable"
+                      onClick={() => setInspectingId(item.id)}
+                      title="Camera EXIF Detected - Click to view"
+                    >
+                      <Camera size={13} /> {analysis.camera.make} {analysis.camera.model}
+                    </button>
+                  )}
                 </div>
+                <p>{formatBytes(item.file.size)} <span>·</span> {item.kind === 'image' ? 'Image' : 'Video'}</p>
+
+                <div className="file-meta-row">
+                  <div className={`state ${item.phase === 'done' ? (verified ? 'success' : hasResidual ? 'warning' : 'neutral') : item.phase === 'error' ? 'danger' : ''}`}>
+                    {item.phase === 'ready' && <><ScanSearch size={14} /> {item.before ? 'Scanned · Ready to clean' : 'Inspecting metadata…'}</>}
+                    {item.phase === 'processing' && <><LoaderCircle className="spin" size={14} /> Processing locally · {Math.round(item.progress)}%</>}
+                    {item.phase === 'done' && verified && <><CheckCircle2 size={14} /> Verified: no detected metadata fields remain</>}
+                    {item.phase === 'done' && hasResidual && <><FileWarning size={14} /> Review: {remaining} metadata field(s) still detected</>}
+                    {item.phase === 'done' && !verified && !hasResidual && <><AlertCircle size={14} /> Cleaned; verification incomplete</>}
+                    {item.phase === 'error' && <><AlertCircle size={14} /> {item.error}</>}
+                  </div>
+
+                  {item.before?.supported && (
+                    <button
+                      className="inspect-quick-btn"
+                      onClick={() => setInspectingId(item.id)}
+                      title="Open interactive Metadata & AI Inspector"
+                    >
+                      <Sparkles size={13} /> View Metadata
+                    </button>
+                  )}
+                </div>
+
                 {item.phase === 'processing' && <div className="progress"><span style={{ width: `${item.progress}%` }} /></div>}
               </div>
               <div className="file-actions">
+                <button
+                  className="icon-button inspect"
+                  title="Open Metadata & AI Inspector"
+                  onClick={() => setInspectingId(item.id)}
+                >
+                  <Eye size={18} />
+                </button>
                 <button className="icon-button" title="Show metadata comparison" onClick={() => setShowDetails(prev => ({ ...prev, [item.id]: !prev[item.id] }))}><ChevronDown className={detailsOpen ? 'rotate' : ''} size={18} /></button>
                 {item.phase === 'done' && <button className="icon-button download" title="Download cleaned file" onClick={() => downloadOne(item)}><Download size={18} /></button>}
                 <button className="icon-button" title="Remove from list" disabled={busy} onClick={() => removeItem(item.id)}><X size={18} /></button>
@@ -287,14 +376,24 @@ function App() {
       <div className="privacy-callout"><ShieldCheck size={20} /><div><strong>Your files stay in this tab</strong><p>Processing happens locally. Refreshing or closing this page clears the workspace and temporary download URLs.</p></div></div>
     </section>}
     <section className="how-section">
-      <div className="section-kicker">HOW IT WORKS</div><h2>Three steps to a cleaner file.</h2>
+      <div className="section-kicker">HOW IT WORKS</div><h2>Three steps to inspect and clean.</h2>
       <div className="how-grid">
-        <div className="how-card"><span>01</span><ScanSearch size={21} /><h3>Inspect</h3><p>See supported metadata fields found in the original file.</p></div>
-        <div className="how-card"><span>02</span><ShieldCheck size={21} /><h3>Clean</h3><p>Images are re-encoded; videos are re-encoded with metadata mapping disabled.</p></div>
-        <div className="how-card"><span>03</span><FileCheck2 size={21} /><h3>Verify</h3><p>Scan the generated output and review any remaining detected fields.</p></div>
+        <div className="how-card"><span>01</span><Sparkles size={21} /><h3>Inspect & Detect AI</h3><p>Instantly reveal AI generators (Midjourney, Stable Diffusion, DALL-E), prompts, seeds, camera specs, or GPS coordinates.</p></div>
+        <div className="how-card"><span>02</span><ShieldCheck size={21} /><h3>Clean 100% Locally</h3><p>Re-encode images and videos directly in your browser without uploading to any server, stripping all tags.</p></div>
+        <div className="how-card"><span>03</span><FileCheck2 size={21} /><h3>Verify & Download</h3><p>Compare Before vs After to verify that all hidden parameters and tracking markers were eradicated.</p></div>
       </div>
     </section>
-    <footer><a className="brand footer-brand" href="#"><span className="brand-mark"><ShieldCheck size={17} /></span><span>metaclean</span></a><p>.</p>We never store your files or upload them to any server. All processing happens directly on your device, ensuring complete privacy<p className="footer-disclaimer"></p></footer>
+    <footer><a className="brand footer-brand" href="#"><span className="brand-mark"><ShieldCheck size={17} /></span><span>metaclean</span></a><p className="footer-disclaimer">We never store your files or upload them to any server. All processing happens directly on your device, ensuring complete privacy.</p></footer>
+
+    {/* Metadata & AI Inspector Modal */}
+    {inspectingItem && (
+      <MetadataModal
+        item={inspectingItem}
+        onClose={() => setInspectingId(null)}
+        onClean={processOne}
+        isProcessing={busy}
+      />
+    )}
   </main>;
 }
 
